@@ -2,22 +2,24 @@ mod api;
 mod log_event;
 mod loki_logger_builder;
 
+use api::{EntryAdapter, LabelPairAdapter, StreamAdapter};
 use env_filter::Filter;
 use log_event::LokiLogEvent;
+use prost::Message;
 use reqwest::Url;
 use serde::Serialize;
-use std::{collections::HashMap, thread};
+use std::{
+    collections::{BTreeMap, HashMap},
+    thread::{self, JoinHandle},
+    time::UNIX_EPOCH,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
-use log::{LevelFilter, Metadata, Record};
+use log::{Level, LevelFilter, Metadata, Record};
 
 /// Re-export of the log crate for use with a different version by the `loki-logger` crate's user.
 pub use log;
-pub use loki_logger_builder::LokiLoggerBuilder;
-
-pub fn builder() -> LokiLoggerBuilder {
-    LokiLoggerBuilder::default()
-}
+pub use loki_logger_builder::{builder, LokiLoggerBuilder};
 
 #[derive(Serialize)]
 struct LokiStream {
@@ -30,11 +32,23 @@ struct LokiRequest {
     streams: Vec<LokiStream>,
 }
 
+impl From<LokiLogEvent> for [String; 2] {
+    fn from(value: LokiLogEvent) -> Self {
+        [
+            value
+                .timestamp
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                .to_string(),
+            value.content,
+        ]
+    }
+}
+
 pub struct LokiLogger {
-    default_filter: LevelFilter,
-    labels: HashMap<String, String>,
     filter: Filter,
-    send: UnboundedSender<LokiLogEvent>,
+    send: UnboundedSender<Option<LokiLogEvent>>,
 }
 
 impl log::Log for LokiLogger {
@@ -44,7 +58,7 @@ impl log::Log for LokiLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
-            let _ = self.send.send(record.into());
+            let _ = self.send.send(Some(record.into()));
         }
     }
 
@@ -52,28 +66,87 @@ impl log::Log for LokiLogger {
 }
 
 impl LokiLogger {
-    fn new(url: Url, labels: HashMap<String, String>, filter: Filter) -> Self {
-        let (send, mut recv) = tokio::sync::mpsc::unbounded_channel();
-        let _ = thread::spawn(move || loki_executor(recv, url));
+    fn new_with_handle(
+        url: Url,
+        labels: BTreeMap<String, String>,
+        filter: Filter,
+    ) -> (Self, JoinHandle<()>) {
+        let (send, recv) = tokio::sync::mpsc::unbounded_channel();
+        let handle = thread::spawn(move || loki_executor(recv, labels, url));
 
-        let default_filter = std::env::var("RUST_LOG")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(LevelFilter::Off);
-        Self {
-            labels,
-            filter,
-            send,
-            default_filter,
-        }
+        (Self { filter, send }, handle)
+    }
+
+    fn new(url: Url, labels: BTreeMap<String, String>, filter: Filter) -> Self {
+        Self::new_with_handle(url, labels, filter).0
     }
 
     pub fn filter(&self) -> LevelFilter {
-        self.default_filter
+        self.filter.filter()
     }
 }
 
-fn loki_executor(mut recv: tokio::sync::mpsc::UnboundedReceiver<LokiLogEvent>, url: Url) {
+/// Wraps a join handle for the loki execution thread, allowing synchronization with the logger during a shutdown.
+/// It is designed to be callable multiple times, so it can be called from, for example, a panic hook, signal handler and the main function so that
+/// logging is correctly completed on abort or on program exit.
+
+pub struct LokiCloser {
+    join_handle: Option<JoinHandle<()>>,
+    send: UnboundedSender<Option<LokiLogEvent>>,
+}
+
+impl LokiCloser {
+    /// Shuts down the associated loki executor, blocking until all messages have been sent. Can be called multiple times safely.
+    pub fn shutdown(&mut self) {
+        let Ok(_) = self.send.send(None) else { return };
+        let Some(join_handle) = self.join_handle.take() else {
+            return;
+        };
+        if let Err(e) = join_handle.join() {
+            eprintln!("Error closing loki logger: {:?}", e);
+        }
+    }
+}
+
+fn build_labels(labels: BTreeMap<String, String>) -> String {
+    let mut s = "{".to_owned();
+    for (name, value) in labels {
+        s.push_str(&name);
+        s.push('=');
+        s.push('"');
+        s.push_str(&value.replace('"', "\""));
+        s.push('"');
+        s.push(',')
+    }
+    if let Some('{') = s.pop() {
+        s.push('{')
+    };
+    s.push('}');
+    s
+}
+
+fn init_labels(labels: BTreeMap<String, String>) -> HashMap<Level, String> {
+    let mut level_labels = HashMap::new();
+    for level in [
+        Level::Error,
+        Level::Warn,
+        Level::Info,
+        Level::Debug,
+        Level::Trace,
+    ] {
+        let mut labels = labels.clone();
+        labels.insert("level".to_owned(), level.to_string());
+        level_labels.insert(level, build_labels(labels));
+    }
+    level_labels
+}
+
+fn loki_executor(
+    mut recv: tokio::sync::mpsc::UnboundedReceiver<Option<LokiLogEvent>>,
+    labels: BTreeMap<String, String>,
+    url: Url,
+) {
+    let labels = init_labels(labels);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -81,10 +154,32 @@ fn loki_executor(mut recv: tokio::sync::mpsc::UnboundedReceiver<LokiLogEvent>, u
         .unwrap();
     rt.block_on(async move {
         let client = reqwest::Client::new();
-        while let Some(event) = recv.recv().await {
+        let mut req = api::PushRequest {
+            streams: Vec::new(),
+        };
+
+        while let Some(Some(event)) = recv.recv().await {
+            let mut req = api::PushRequest {
+                streams: vec![StreamAdapter {
+                    labels: labels[&event.level].clone(),
+                    entries: vec![EntryAdapter {
+                        timestamp: Some(event.timestamp.into()),
+                        line: ,
+                        structured_metadata: event
+                            .structured_metadata
+                            .into_iter()
+                            .map(|(name, value)| LabelPairAdapter { name, value })
+                            .collect(),
+                    }],
+                    hash: 0,
+                }],
+            };
+
+            let w = snap::write::FrameEncoder::new(Vec::new());
+            w.
             if let Err(e) = client
                 .post(url.clone())
-                .json(&LokiRequest::from(event))
+                .body(req.encode(&mut w))
                 .send()
                 .await
                 .and_then(|res| res.error_for_status())

@@ -21,7 +21,7 @@
 // })
 // .build();
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use log::LevelFilter;
 use reqwest::IntoUrl;
@@ -31,10 +31,17 @@ use crate::LokiLogger;
 #[derive(Default)]
 pub struct LokiLoggerBuilder {
     filters: env_filter::Builder,
-    labels: HashMap<String, String>,
+    labels: BTreeMap<String, String>,
 }
 
 impl LokiLoggerBuilder {
+    pub fn from_env(env: &str) -> Self {
+        LokiLoggerBuilder {
+            filters: env_filter::Builder::from_env(env),
+            labels: BTreeMap::default(),
+        }
+    }
+
     pub fn filter_module(mut self, module: &str, level_filter: LevelFilter) -> Self {
         self.filters.filter_module(module, level_filter);
         self
@@ -57,4 +64,8 @@ impl LokiLoggerBuilder {
             self.filters.build(),
         ))
     }
+}
+
+pub fn builder() -> LokiLoggerBuilder {
+    LokiLoggerBuilder::from_env("RUST_LOG")
 }

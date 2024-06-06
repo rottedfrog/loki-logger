@@ -10,11 +10,11 @@ use std::time::SystemTime;
 
 use log::Level;
 
-pub(crate) struct LokiLogEvent {
-    pub(crate) level: Level,
-    pub(crate) timestamp: SystemTime,
-    pub(crate) structured_metadata: HashMap<String, String>,
-    pub(crate) content: String,
+pub struct LokiLogEvent {
+    pub level: Level,
+    pub timestamp: SystemTime,
+    pub structured_metadata: HashMap<String, String>,
+    pub content: String,
 }
 
 impl<'a> From<&Record<'a>> for LokiLogEvent {
