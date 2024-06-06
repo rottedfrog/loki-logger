@@ -30,13 +30,18 @@ use crate::LokiLogger;
 
 #[derive(Default)]
 pub struct LokiLoggerBuilder {
-    filters: HashMap<String, LevelFilter>,
+    filters: env_filter::Builder,
     labels: HashMap<String, String>,
 }
 
 impl LokiLoggerBuilder {
     pub fn filter_module(mut self, module: &str, level_filter: LevelFilter) -> Self {
-        self.filters.insert(module.to_owned(), level_filter);
+        self.filters.filter_module(module, level_filter);
+        self
+    }
+
+    pub fn filter_level(mut self, level_filter: LevelFilter) -> Self {
+        self.filters.filter_level(level_filter);
         self
     }
 
@@ -45,7 +50,11 @@ impl LokiLoggerBuilder {
         self
     }
 
-    pub fn build(self, url: impl IntoUrl) -> Result<LokiLogger, reqwest::Error> {
-        Ok(LokiLogger::new(url.into_url()?, self.labels, self.filters))
+    pub fn build(mut self, url: impl IntoUrl) -> Result<LokiLogger, reqwest::Error> {
+        Ok(LokiLogger::new(
+            url.into_url()?,
+            self.labels,
+            self.filters.build(),
+        ))
     }
 }
