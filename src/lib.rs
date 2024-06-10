@@ -1,21 +1,21 @@
-mod api;
+//mod api;
 mod log_event;
 mod loki_logger_builder;
 
-use api::{EntryAdapter, LabelPairAdapter, StreamAdapter};
+use core::fmt;
 use env_filter::Filter;
 use log_event::LokiLogEvent;
-use prost::Message;
 use reqwest::Url;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
+    sync::RwLock,
     thread::{self, JoinHandle},
     time::UNIX_EPOCH,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
-use log::{Level, LevelFilter, Metadata, Record};
+use log::{LevelFilter, Metadata, Record};
 
 /// Re-export of the log crate for use with a different version by the `loki-logger` crate's user.
 pub use log;
@@ -23,13 +23,26 @@ pub use loki_logger_builder::{builder, LokiLoggerBuilder};
 
 #[derive(Serialize)]
 struct LokiStream {
-    stream: HashMap<String, String>,
-    values: Vec<[String; 2]>,
+    stream: BTreeMap<String, String>,
+    values: [[String; 2]; 1],
 }
 
 #[derive(Serialize)]
 struct LokiRequest {
-    streams: Vec<LokiStream>,
+    streams: [LokiStream; 1],
+}
+
+impl LokiRequest {
+    fn new(event: LokiLogEvent, labels: &BTreeMap<String, String>) -> Self {
+        let mut stream = labels.clone();
+        stream.insert("level".to_owned(), event.level.to_string());
+        Self {
+            streams: [LokiStream {
+                stream,
+                values: [event.into()],
+            }],
+        }
+    }
 }
 
 impl From<LokiLogEvent> for [String; 2] {
@@ -66,19 +79,24 @@ impl log::Log for LokiLogger {
 }
 
 impl LokiLogger {
-    fn new_with_handle(
+    fn new_with_closer(
         url: Url,
         labels: BTreeMap<String, String>,
         filter: Filter,
-    ) -> (Self, JoinHandle<()>) {
+    ) -> (Self, LokiCloser) {
         let (send, recv) = tokio::sync::mpsc::unbounded_channel();
-        let handle = thread::spawn(move || loki_executor(recv, labels, url));
+        let join_handle = thread::spawn(move || loki_executor(recv, labels, url));
 
-        (Self { filter, send }, handle)
-    }
-
-    fn new(url: Url, labels: BTreeMap<String, String>, filter: Filter) -> Self {
-        Self::new_with_handle(url, labels, filter).0
+        (
+            Self {
+                filter,
+                send: send.clone(),
+            },
+            LokiCloser {
+                join_handle: RwLock::new(Some(join_handle)),
+                send,
+            },
+        )
     }
 
     pub fn filter(&self) -> LevelFilter {
@@ -91,15 +109,21 @@ impl LokiLogger {
 /// logging is correctly completed on abort or on program exit.
 
 pub struct LokiCloser {
-    join_handle: Option<JoinHandle<()>>,
+    join_handle: RwLock<Option<JoinHandle<()>>>,
     send: UnboundedSender<Option<LokiLogEvent>>,
+}
+
+impl fmt::Debug for LokiCloser {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LokiCloser{...}")
+    }
 }
 
 impl LokiCloser {
     /// Shuts down the associated loki executor, blocking until all messages have been sent. Can be called multiple times safely.
-    pub fn shutdown(&mut self) {
+    pub fn shutdown(&self) {
         let Ok(_) = self.send.send(None) else { return };
-        let Some(join_handle) = self.join_handle.take() else {
+        let Some(join_handle) = self.join_handle.write().unwrap().take() else {
             return;
         };
         if let Err(e) = join_handle.join() {
@@ -108,45 +132,11 @@ impl LokiCloser {
     }
 }
 
-fn build_labels(labels: BTreeMap<String, String>) -> String {
-    let mut s = "{".to_owned();
-    for (name, value) in labels {
-        s.push_str(&name);
-        s.push('=');
-        s.push('"');
-        s.push_str(&value.replace('"', "\""));
-        s.push('"');
-        s.push(',')
-    }
-    if let Some('{') = s.pop() {
-        s.push('{')
-    };
-    s.push('}');
-    s
-}
-
-fn init_labels(labels: BTreeMap<String, String>) -> HashMap<Level, String> {
-    let mut level_labels = HashMap::new();
-    for level in [
-        Level::Error,
-        Level::Warn,
-        Level::Info,
-        Level::Debug,
-        Level::Trace,
-    ] {
-        let mut labels = labels.clone();
-        labels.insert("level".to_owned(), level.to_string());
-        level_labels.insert(level, build_labels(labels));
-    }
-    level_labels
-}
-
 fn loki_executor(
     mut recv: tokio::sync::mpsc::UnboundedReceiver<Option<LokiLogEvent>>,
     labels: BTreeMap<String, String>,
     url: Url,
 ) {
-    let labels = init_labels(labels);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -154,32 +144,10 @@ fn loki_executor(
         .unwrap();
     rt.block_on(async move {
         let client = reqwest::Client::new();
-        let mut req = api::PushRequest {
-            streams: Vec::new(),
-        };
-
         while let Some(Some(event)) = recv.recv().await {
-            let mut req = api::PushRequest {
-                streams: vec![StreamAdapter {
-                    labels: labels[&event.level].clone(),
-                    entries: vec![EntryAdapter {
-                        timestamp: Some(event.timestamp.into()),
-                        line: ,
-                        structured_metadata: event
-                            .structured_metadata
-                            .into_iter()
-                            .map(|(name, value)| LabelPairAdapter { name, value })
-                            .collect(),
-                    }],
-                    hash: 0,
-                }],
-            };
-
-            let w = snap::write::FrameEncoder::new(Vec::new());
-            w.
             if let Err(e) = client
                 .post(url.clone())
-                .body(req.encode(&mut w))
+                .json(&LokiRequest::new(event, &labels))
                 .send()
                 .await
                 .and_then(|res| res.error_for_status())
